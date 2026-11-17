@@ -9,6 +9,7 @@ import { fetchRetry, loadBase, morphBody, loadItem, fitItem, visibleBodyIndices,
 import { fitRig, tPose, skinPositions, smoothNormals, encodeImage, writeVRM } from "../lib/vrm-export.js";
 import { addHairSprings, springBoneExtension } from "../lib/springs.js";
 import { skirtSkin } from "../lib/cloth.js";
+import { loadLandmarker, loadHairSegmenter, findHair, facePoints, alignFlat, solveBounded, sampleColors, toLinear, toSRGB, luminance, lightness } from "../lib/photo-fit.js";
 
 const A = "../assets/";
 const MAX_TRIANGLES = 40000;  // So Many Rooms' AVATAR_BUDGET
@@ -229,7 +230,7 @@ function updateBodyIndices() {
 }
 
 // ---- Refit -----------------------------------------------------------------------------------
-function refit() {
+function refit(only = null) {
   morphBody(base, recipe.body, current, recipe.face);
   const normals = smoothNormals(current, bodySource, base.body.indices);
   const pos = bodyGeom.attributes.position.array, nor = bodyGeom.attributes.normal.array;
@@ -245,20 +246,21 @@ function refit() {
   const head = base.rig.cubes["joint-head"];
   faceHeight = (head.reduce((s, v) => s + current[v * 3 + 1], 0) / head.length - lowest) / base.unitsPerMeter + 0.04;
   for (const [slot, entry] of worn) {
+    if (only && !only.has(slot)) continue;
     fitItem(entry.item, current, entry.fitted);
     if (slot === "eyebrows") raiseAlongSkin(entry, normals, recipe.eyebrowHeight / 10);
     if (INFLATE[slot]) inflate(entry, INFLATE[slot]);
   }
-  if (worn.has("top") && worn.has("bottom")) tuck(worn.get("bottom"), worn.get("top"));
+  if (!only && worn.has("top") && worn.has("bottom")) tuck(worn.get("bottom"), worn.get("top"));
   let tucked = null;
   for (const slot of ["bottom", "outfit"]) {  // trousers go into tall boots (never skirts, dresses or robes)
     const e = worn.get(slot);
-    if (e && worn.has("shoes") && !index.categories[slot]?.items.find((i) => i.id === e.item.id)?.skirt)
+    if (!only && e && worn.has("shoes") && !index.categories[slot]?.items.find((i) => i.id === e.item.id)?.skirt)
       tucked = tuckIntoBoots(e, worn.get("shoes"), normals) ?? tucked;
   }
-  hideSkinInBoots(tucked);
-  hatHair(worn.get("hair"), worn.get("hat"));
-  for (const entry of worn.values()) {
+  if (!only) { hideSkinInBoots(tucked); hatHair(worn.get("hair"), worn.get("hat")); }
+  for (const [slot, entry] of worn) {
+    if (only && !only.has(slot)) continue;
     const p = entry.mesh.geometry.attributes.position.array, src = entry.item.source;
     for (let r = 0; r < src.length; r++) for (let k = 0; k < 3; k++) p[r * 3 + k] = entry.fitted[src[r] * 3 + k];
     entry.mesh.geometry.attributes.position.needsUpdate = true;
@@ -699,6 +701,400 @@ async function surprise() {
 }
 $("surprise").addEventListener("click", () => surprise().catch((err) => { $("status").textContent = err.message; }));
 
+// ---- Start from a photo ----------------------------------------------------------------------
+// The face finder (web/lib/photo-fit.js) finds 468 points on the photo's face. We render our own
+// face at the photo's angle and find the same points there, then move the face sliders and the
+// ancestry mix until the two match: each round renders the face once per slider, nudged, to see how
+// the points move (Gauss-Newton with bounds, pulled gently toward 0 so unclear sliders stay put).
+// The face finder reads real faces a little differently from ours, so the photo's points are first
+// corrected by the average difference (web/lib/photo-bias.json, calibrated on public-domain
+// portraits). Skin tone, eye and hair color come from the photo's pixels. Female–Male and age stay
+// as set: they change the whole body. The photo never leaves the browser.
+// The face finder's lip and eye outline points.
+const LIP_POINTS = new Set([61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 185, 40, 39, 37, 0, 267, 269, 270, 409,
+  78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 191, 80, 81, 82, 13, 312, 311, 310, 415]);
+const EYE_POINTS = new Set([33, 7, 163, 144, 145, 153, 154, 155, 133, 246, 161, 160, 159, 158, 157, 173,
+  263, 249, 390, 373, 374, 380, 381, 382, 362, 466, 388, 387, 386, 385, 384, 398]);
+const PHOTO_SLOTS = new Set(["eyes", "eyebrows", "eyelashes01"]);  // what the face finder sees of us
+const FIT_FACE = ["noseSize", "noseWidth", "noseLength", "noseDepth", "noseHump", "noseTip", "noseNostrils",
+  "headWidth", "headLength", "chinWidth", "chinProminent", "cheekbones", "lips", "mouthWidth", "eyeSize"];
+const EYE_IRIS = { brown: [70, 13, 2], brownlight: [111, 81, 37], green: [59, 93, 53], bluegreen: [119, 180, 162], blue: [49, 91, 99],
+  lightblue: [105, 166, 178], deepblue: [56, 57, 89], grey: [135, 150, 140], ice: [125, 161, 137] };  // iris medians of the textures
+function fitVariables() {
+  const setRace = (african, asian) => {
+    african = Math.max(0, african); asian = Math.max(0, asian);
+    const sum = african + asian; if (sum > 1) { african /= sum; asian /= sum; }
+    recipe.body.race = { african, asian, caucasian: 1 - african - asian };
+  };
+  return [
+    ...FIT_FACE.map((id) => ({ get: () => recipe.face[id] ?? 0, set: (v) => { recipe.face[id] = v; }, lo: -1, hi: 1, h: 0.35 })),
+    { get: () => recipe.body.race.african, set: (v) => setRace(v, recipe.body.race.asian), lo: 0, hi: 1, h: 0.25 },
+    { get: () => recipe.body.race.asian, set: (v) => setRace(recipe.body.race.african, v), lo: 0, hi: 1, h: 0.25 },
+  ];
+}
+const faceCamera = new THREE.PerspectiveCamera(20, 1, 0.05, 10);
+const faceView = { yaw: 0, pitch: 0 };  // the photo's head turn, so we measure our face at the same angle
+/** Our face rendered at the photo's angle, neutral, with only what the face finder should see; its
+ * points. */
+function ourFacePoints(lm) {
+  for (const mesh of [bodyMesh, ...[...worn.values()].map((e) => e.mesh)]) mesh.morphTargetInfluences?.fill(0);
+  const hidden = [];
+  for (const [slot, e] of worn) if (!PHOTO_SLOTS.has(slot) && e.mesh.visible) { e.mesh.visible = false; hidden.push(e.mesh); }
+  const grid = scene.children.find((o) => o.isGridHelper); if (grid) grid.visible = false;
+  const canvas = renderer.domElement;
+  faceCamera.aspect = canvas.width / canvas.height; faceCamera.updateProjectionMatrix();
+  const fh = faceHeight - 0.05;
+  const { yaw, pitch } = faceView;
+  faceCamera.position.set(Math.sin(yaw) * Math.cos(pitch), fh + Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+  faceCamera.lookAt(0, fh, 0);
+  renderer.render(scene, faceCamera);
+  const found = facePoints(lm, canvas);
+  const colors = found ? sampleColors(canvas, found.raw) : null;
+  for (const m of hidden) m.visible = true; if (grid) grid.visible = true;
+  return found && { ...found, colors };
+}
+async function readPhoto(file) {
+  const image = await createImageBitmap(file);
+  const scale = Math.min(1, 1280 / Math.max(image.width, image.height));
+  const photo = document.createElement("canvas");
+  photo.width = Math.round(image.width * scale); photo.height = Math.round(image.height * scale);
+  photo.getContext("2d").drawImage(image, 0, 0, photo.width, photo.height);
+  return photo;
+}
+/** The face in the photo: { photo, theirs }. A small face in a big picture is looked at again alone,
+ * larger (finer points, cleaner colors); `photo` is then that crop. */
+function findFace(lm, photo) {
+  let theirs = facePoints(lm, photo);
+  if (!theirs) return null;
+  const xs = theirs.raw.slice(0, 468).map((p) => p.x * photo.width), ys = theirs.raw.slice(0, 468).map((p) => p.y * photo.height);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const side = Math.min(Math.max(photo.width, photo.height), 2.2 * Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)));
+  if (side < 0.7 * Math.min(photo.width, photo.height)) {
+    const crop = document.createElement("canvas"); crop.width = crop.height = 768;
+    crop.getContext("2d").drawImage(photo, cx - side / 2, cy - side / 2, side, side, 0, 0, 768, 768);
+    const again = facePoints(lm, crop);
+    if (again) return { photo: crop, theirs: again };
+  }
+  return { photo, theirs };
+}
+/** How much each point counts. Above the brows less: hair covers or shifts it, in the photo and in
+ * ours differently. Our face is neutral, so a smiling or squinting photo's lips and eyes count less
+ * (our face shapes can't make a natural smile to compare with). */
+function photoWeights(theirs, ours) {
+  const P = ours.pts, browY = (P[105 * 3 + 1] + P[334 * 3 + 1]) / 2, faceH = P[10 * 3 + 1] - P[152 * 3 + 1];
+  const b = theirs.blend, smile = Math.max(b.mouthSmileLeft ?? 0, b.mouthSmileRight ?? 0, (b.jawOpen ?? 0) * 2);
+  const squint = Math.max(b.eyeSquintLeft ?? 0, b.eyeSquintRight ?? 0, b.eyeBlinkLeft ?? 0, b.eyeBlinkRight ?? 0);
+  const lipWt = Math.max(0.1, 1 - smile * 1.2), eyeWt = Math.max(0.2, 1 - squint);
+  const pointWt = new Float64Array(P.length / 3).map((_, i) => (P[i * 3 + 1] > browY + 0.04 * faceH ? 0.15 : 1) *
+    (LIP_POINTS.has(i) ? lipWt : EYE_POINTS.has(i) ? eyeWt : 1));
+  const wt = new Float64Array(P.length).map((_, k) => (k % 3 === 2 ? 0 : pointWt[(k - k % 3) / 3]));  // x and y only
+  return { pointWt, wt };
+}
+/** The photo's head turn: try angles, keep the one whose points match the photo's best (faceView). */
+function findAngle(lm, theirs, pointWt, wt) {
+  const misfitAt = (yaw, pitch) => {
+    Object.assign(faceView, { yaw, pitch });
+    const f = ourFacePoints(lm); if (!f) return Infinity;
+    const a = alignFlat(theirs.pts, f.pts, pointWt);
+    let s = 0; for (let k = 0; k < a.length; k++) s += wt[k] * (a[k] - f.pts[k]) ** 2;
+    return s;
+  };
+  let best = { yaw: 0, pitch: 0, m: misfitAt(0, 0) };
+  for (const step of [0.2, 0.1, 0.05]) {
+    for (let moved = true, tries = 0; moved && tries < 5; tries++) {
+      moved = false;
+      for (const [dy, dp] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const yaw = best.yaw + dy * step, pitch = best.pitch + dp * step * 0.6;
+        if (Math.abs(yaw) > 0.8 || Math.abs(pitch) > 0.4) continue;
+        const m = misfitAt(yaw, pitch);
+        if (m < best.m) { best = { yaw, pitch, m }; moved = true; }
+      }
+    }
+  }
+  Object.assign(faceView, { yaw: best.yaw, pitch: best.pitch });
+}
+/** The photo's points on our face's (in its picture), less how the face finder reads real faces
+ * differently from ours (photoBias: an average real face then lands on our average face). */
+function photoTarget(theirs, ours, pointWt) {
+  const target = alignFlat(theirs.pts, ours.pts, pointWt);
+  if (photoBias) {
+    const g = recipe.body.gender, faceH = ours.pts[10 * 3 + 1] - ours.pts[152 * 3 + 1];
+    for (let i = 0; i < target.length / 3; i++) for (let k = 0; k < 2; k++)
+      target[i * 3 + k] -= faceH * (g * photoBias.male[i * 2 + k] + (1 - g) * photoBias.female[i * 2 + k]);
+  }
+  return target;
+}
+let photoBias = null;
+
+/** Fit the face to one or more photos of the same person (canvases), e.g. straight on and turned
+ * to each side: all are matched at once, each at its own angle. A turned head shows the nose's
+ * depth and the chin's profile, which a straight-on photo can't. Colors come from the most frontal. */
+async function fromPhotos(photos, say) {
+  endPreview();
+  say("Loading the face finder (about 17 MB the first time)…");
+  showPhotos(photos.map((photo) => ({ photo })));
+  const lm = await loadLandmarker();
+  photoBias ??= await fetchRetry(new URL("../lib/photo-bias.json", import.meta.url)).then((r) => r.json()).catch(() => null);
+  say("Finding the face…");
+  const views = photos.map((p) => findFace(lm, p)).filter(Boolean);
+  if (!views.length) throw new Error("No face found. Try a photo looking straight at the camera, in good light.");
+  showPhotos(views);
+  // Face shape and ancestry.
+  recipe.face = {};
+  const vars = fitVariables(), lo = vars.map((v) => v.lo), hi = vars.map((v) => v.hi);
+  const measure = () => { refit(PHOTO_SLOTS); const f = ourFacePoints(lm); if (!f) throw new Error("Couldn't measure our own face"); return f; };
+  say(views.length > 1 ? "Finding the head's angle in each photo…" : "Finding the head's angle…");
+  for (const v of views) {
+    Object.assign(faceView, { yaw: 0, pitch: 0 });
+    Object.assign(v, photoWeights(v.theirs, measure()));
+    findAngle(lm, v.theirs, v.pointWt, v.wt);
+    v.view = { ...faceView };
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  for (let round = 0; round < 3; round++) {
+    say(`Matching the face shape (round ${round + 1} of 3)…`);
+    await new Promise((r) => setTimeout(r, 0));
+    const x = vars.map((v) => v.get()), r = [], wt = [], J = vars.map(() => []);
+    for (const v of views) {
+      Object.assign(faceView, v.view);
+      const ours = measure();
+      const target = photoTarget(v.theirs, ours, v.pointWt);
+      for (let k = 0; k < target.length; k++) { r.push(target[k] - ours.pts[k]); wt.push(v.wt[k]); }
+      for (let i = 0; i < vars.length; i++) {
+        const step = x[i] + vars[i].h <= hi[i] ? vars[i].h : -vars[i].h;
+        vars[i].set(x[i] + step);
+        const moved = alignFlat(measure().pts, ours.pts, v.pointWt);
+        for (let k = 0; k < moved.length; k++) J[i].push((moved[k] - ours.pts[k]) / step);
+        vars[i].set(x[i]);
+        if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));  // keep the page responsive
+      }
+    }
+    const d = solveBounded(J, r, x, lo, hi, 0.08, wt);
+    vars.forEach((v, i) => v.set(x[i] + d[i]));
+  }
+  // Colors, from the most frontal photo: skin by its lightness, eyes by hue, hair brought to our light.
+  const front = views.reduce((a, b) => (Math.abs(b.view.yaw) < Math.abs(a.view.yaw) ? b : a));
+  Object.assign(faceView, { yaw: 0, pitch: 0 });
+  const ours = measure(), pc = sampleColors(front.photo, front.theirs.raw), oc = ours.colors;
+  const hair = await loadHairSegmenter().then((seg) => findHair(seg, front.photo, front.theirs.raw)).catch(() => null);
+  if (hair) pc.hair = hair.cover < 0.12 ? null : hair.color;
+  const notes = [];
+  if (pc.skin && !recipe.skin.color) {
+    // The skin's lightness (CIELAB L*). Photos are exposed for the face, and lit skin reads lighter
+    // than its color, darker skin much more so: L* 73 is our lightest tone, 54 our darkest (from
+    // official portraits; the white of the eyes is too often shaded or squinted away to measure by).
+    recipe.skin.tone = Math.round(Math.min(1, Math.max(0, (73 - lightness(pc.skin)) / 19)) * 100) / 100;
+  }
+  if (pc.iris) {
+    const chroma = (c) => { const l = c.map(toLinear), s = l[0] + l[1] + l[2] + 1e-6; return [l[0] / s, l[1] / s, l[2] / s, Math.log(s + 0.01)]; };
+    const want = chroma(pc.iris);
+    const dist = (c) => { const g = chroma(c); return Math.hypot(g[0] - want[0], g[1] - want[1], g[2] - want[2]) + 0.3 * Math.abs(g[3] - want[3]); };
+    recipe.eyes = Object.keys(EYE_IRIS).filter((k) => k in index.eyeColors).sort((p, q) => dist(EYE_IRIS[p]) - dist(EYE_IRIS[q]))[0];
+  }
+  if (hair && hair.cover < 0.12) {  // bald or shaved
+    recipe.hair.style = null;
+    notes.push("no hair on top, so none on the avatar");
+  } else if (pc.hair) {
+    if (hair && !recipe.hair.style) recipe.hair.style = DEFAULT_RECIPE.hair.style;  // brought to our light: by the white of the eyes, or else by the skin
+    const gain = Math.min(1.4, Math.max(0.8, pc.sclera && oc?.sclera ? luminance(oc.sclera) / luminance(pc.sclera)
+      : oc?.skin && pc.skin ? luminance(oc.skin) / luminance(pc.skin) : 1));
+    recipe.hair.color = "#" + pc.hair.map((c) => Math.min(255, toSRGB(Math.min(1, toLinear(c) * gain))).toString(16).padStart(2, "0")).join("");
+  } else notes.push("hair color left as it was (none found above the forehead)");
+  if (views.length < photos.length) notes.push(`no face found in ${photos.length - views.length} of the photos`);
+  await applyRecipe(structuredClone(recipe));
+  setCamera("face");
+  return notes;
+}
+// Calibration (web/lib/photo-bias.json; run from the test hook, see STATUS.md): how the face finder
+// reads real faces (photos: [{url, gender}]) vs our face with a matching ancestry mix; the mean
+// difference per point, as a fraction of the face's height.
+async function calibratePhotos(photos, race, age = 0.62) {
+  const lm = await loadLandmarker(), sums = { male: null, female: null }, weights = { male: null, female: null }, info = [];
+  for (const { url, gender } of photos) {
+    const photo = await readPhoto(await (await fetch(url)).blob());
+    const found = findFace(lm, photo);
+    if (!found) { info.push({ url, found: false }); continue; }
+    recipe.body = { ...recipe.body, gender, age, race: { ...race } }; recipe.face = {};
+    Object.assign(faceView, { yaw: 0, pitch: 0 });
+    refit(PHOTO_SLOTS);
+    const first = ourFacePoints(lm);
+    const { pointWt, wt } = photoWeights(found.theirs, first);
+    findAngle(lm, found.theirs, pointWt, wt);
+    const ours = ourFacePoints(lm), faceH = ours.pts[10 * 3 + 1] - ours.pts[152 * 3 + 1];
+    const a = alignFlat(found.theirs.pts, ours.pts, pointWt), key = gender ? "male" : "female";
+    sums[key] ??= new Float64Array(936); weights[key] ??= new Float64Array(468);
+    for (let i = 0; i < 468; i++) {
+      for (let k = 0; k < 2; k++) sums[key][i * 2 + k] += pointWt[i] * (a[i * 3 + k] - ours.pts[i * 3 + k]) / faceH;
+      weights[key][i] += pointWt[i];
+    }
+    const pc = sampleColors(found.photo, found.theirs.raw);
+    info.push({ url: url.split("/").pop(), view: { ...faceView }, L: pc.skin ? +lightness(pc.skin).toFixed(1) : null });
+  }
+  Object.assign(faceView, { yaw: 0, pitch: 0 });
+  const out = {};
+  for (const key of ["male", "female"]) out[key] = Array.from(sums[key], (v, j) => {
+    const w = weights[key][j >> 1];
+    return w > 1 ? +(v / w).toFixed(5) : 0;  // points that hardly counted anywhere (smiles): no correction
+  });
+  return { bias: out, info };
+}
+/** The photos (and the points found on them) side by side in the dialog. */
+function showPhotos(views) {
+  const c = $("photo-canvas"), n = views.length, H = 300, gap = 6;
+  const widths = views.map(({ photo }) => Math.round(H * photo.width / photo.height));
+  c.width = widths.reduce((s, w) => s + w, 0) + gap * (n - 1); c.height = H;
+  const ctx = c.getContext("2d");
+  let x0 = 0;
+  views.forEach(({ photo, theirs }, i) => {
+    const W = widths[i];
+    ctx.drawImage(photo, x0, 0, W, H);
+    if (theirs) {
+      ctx.fillStyle = "rgba(120, 220, 255, 0.8)";
+      for (let k = 0; k < 468; k += 2) ctx.fillRect(x0 + theirs.raw[k].x * W - 0.75, theirs.raw[k].y * H - 0.75, 1.5, 1.5);
+    }
+    x0 += W + gap;
+  });
+}
+
+// The camera: three shots, straight on and turned a little to each side. Nothing starts until Start
+// is pressed. Each step says what to do in large type over the video; when the face finder sees the
+// head held at the right angle, a 3-2-1 countdown runs (it starts over if the head moves away), then
+// a flash, a check mark on the step, and a moment before the next. "Take now" takes it as it is.
+let webcam = null;  // { stream, stop: true when cancelled }
+let photoRun = 0;  // goes up on each start and on Cancel: a camera that opens after a Cancel is closed again
+const SIDE = [15, 35];  // degrees of head turn for the side shots
+const SHOTS = [
+  { say: "Look straight into the camera", hint: (yaw) => (Math.abs(yaw) < 7 ? null : "Turn to face the camera") },
+  { say: "Turn your head a little to one side, eyes still on the camera",
+    hint: (yaw) => (Math.abs(yaw) < SIDE[0] ? "A bit more" : Math.abs(yaw) > SIDE[1] ? "Not quite so far" : null) },
+  { say: "Now a little to the other side, eyes still on the camera",
+    hint: (yaw, side) => (Math.sign(yaw) === Math.sign(side) && Math.abs(yaw) > 7 ? "The other side" :
+      Math.abs(yaw) < SIDE[0] ? "A bit more" : Math.abs(yaw) > SIDE[1] ? "Not quite so far" : null) },
+];
+const HOLD = 2.4;  // seconds held still for a shot (the countdown)
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+function stopCamera() {
+  if (!webcam) return;
+  webcam.stop = true; webcam.stream.getTracks().forEach((t) => t.stop());
+  $("photo-video").srcObject = null; $("photo-cam").hidden = true; $("photo-take").hidden = true;
+  $("photo-box").querySelector(".card").classList.remove("wide");
+  webcam = null;
+}
+function camSay(big, small = "") {
+  $("cam-say").querySelector("b").textContent = big;
+  $("cam-say").querySelector("small").textContent = small;
+}
+function camSteps(now, done) {
+  [...$("cam-steps").children].forEach((el, i) => {
+    el.className = i < done ? "done" : i === now ? "now" : "";
+    el.textContent = (i < done ? "✓ " : `${i + 1} `) + ["Straight", "Turned", "Other way"][i];
+  });
+}
+async function cameraShots(say, run) {
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser can't use the camera here (it needs a secure page: https, or localhost). Choose photos instead.");
+  say("Waiting for the camera…");
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 960 } }, audio: false })
+    .catch(() => { throw new Error("No camera, or it wasn't allowed. Choose photos instead."); });
+  if (run !== photoRun) { stream.getTracks().forEach((t) => t.stop()); return null; }
+  const me = webcam = { stream, stop: false };
+  const video = $("photo-video");
+  video.srcObject = stream;
+  $("photo-box").querySelector(".card").classList.add("wide");
+  $("photo-cam").hidden = false; $("photo-canvas").hidden = true; say("");
+  await video.play();
+  camSteps(-1, 0); $("cam-count").textContent = "";
+  camSay("Getting ready…", "Loading the face finder (about 17 MB the first time)");
+  const lm = await loadLandmarker();
+  if (me.stop) return null;
+  // Wait for Start.
+  camSay("Three photos: straight on, then turned a little each way", "Keep your eyes on the camera, and a neutral face. Press Start when ready.");
+  $("cam-go").hidden = false;
+  await new Promise((resolve) => { $("cam-go").onclick = resolve; const t = setInterval(() => { if (me.stop) { clearInterval(t); resolve(); } }, 200); });
+  $("cam-go").hidden = true;
+  if (me.stop) return null;
+  const shots = [];
+  let side = 0;  // the first turn's direction: the second goes the other way
+  for (const [n, shot] of SHOTS.entries()) {
+    camSteps(n, n); camSay(shot.say);
+    $("photo-take").hidden = false;
+    let take = false; $("photo-take").onclick = () => { take = true; };
+    let since = null, frame = null;
+    while (!me.stop) {
+      await pause(100);
+      if (me.stop || !video.videoWidth) continue;
+      frame = document.createElement("canvas");
+      frame.width = video.videoWidth; frame.height = video.videoHeight;
+      frame.getContext("2d").drawImage(video, 0, 0);
+      if (take) break;
+      const yaw = facePoints(lm, frame)?.turn?.yaw;
+      const hint = yaw == null ? "Can't see your face" : shot.hint(yaw, side);
+      if (hint) { since = null; $("cam-count").textContent = ""; camSay(shot.say, hint); continue; }
+      since ??= performance.now();
+      const left = HOLD - (performance.now() - since) / 1000;
+      camSay(shot.say, "Hold it there");
+      $("cam-count").textContent = left > 0 ? Math.ceil(left / (HOLD / 3)) : "";
+      if (left <= 0) { if (n === 1) side = yaw || 1; break; }
+    }
+    if (me.stop) return null;
+    if (n === 1 && take) side = facePoints(lm, frame)?.turn?.yaw || 1;
+    shots.push(frame);
+    $("cam-count").textContent = "";
+    $("cam-flash").classList.add("on"); requestAnimationFrame(() => requestAnimationFrame(() => $("cam-flash").classList.remove("on")));
+    camSteps(-1, n + 1); camSay(`✓ Photo ${n + 1} of 3 taken`, n < 2 ? "Next one coming up…" : "All done");
+    $("photo-take").hidden = true;
+    await pause(1300);
+    if (me.stop) return null;
+  }
+  stopCamera();
+  $("photo-canvas").hidden = false;
+  return shots;
+}
+
+let photoBefore = null;
+const photoSay = (text) => { $("photo-status").textContent = text; };
+function photoStep(step) {  // "start": choose the camera or photos; "busy"; "done"
+  $("photo-start").hidden = step !== "start";
+  $("photo-canvas").hidden = step === "start" || !!webcam;
+  $("photo-undo").hidden = step !== "done" || !photoBefore;
+  $("photo-done").textContent = step === "done" ? "Done" : "Cancel";
+  $("photo-done").disabled = false;
+}
+async function runPhotoFit(getPhotos) {
+  const before = structuredClone(recipe), run = ++photoRun;
+  let failed = false;
+  photoBefore = null; photoStep("busy");
+  try {
+    const photos = await getPhotos(run);
+    if (!photos || run !== photoRun) return;  // cancelled
+    $("photo-done").disabled = true;
+    const notes = await fromPhotos(photos, photoSay);
+    photoBefore = before;
+    photoSay("Done (this is a beta). Face shape, ancestry mix, skin tone, eye and hair color now follow the photo" + (photos.length > 1 ? "s" : "") +
+      (notes.length ? ` (${notes.join("; ")})` : "") + ". Hair style and clothes are yours to pick. It's a resemblance, not a likeness: adjust anything you like.");
+  } catch (err) {
+    stopCamera(); failed = true;
+    photoSay(err.message);
+    Object.assign(faceView, { yaw: 0, pitch: 0 });
+    await applyRecipe(before);
+  } finally { if (run === photoRun) photoStep(failed ? "start" : "done"); }  // after a failure: try again
+}
+$("photo").addEventListener("click", () => {
+  $("photo-box").hidden = false; photoBefore = null; photoStep("start");
+  photoSay("Take three quick shots with the camera (straight on, then turned a little each way), or choose one or more photos of the same face.");
+});
+$("photo-pick").addEventListener("click", () => $("photo-file").click());
+$("photo-camera").addEventListener("click", () => runPhotoFit((run) => cameraShots(photoSay, run)));
+$("photo-file").addEventListener("change", (e) => {
+  const files = [...e.target.files].slice(0, 5); e.target.value = "";
+  if (files.length) runPhotoFit(() => Promise.all(files.map(readPhoto)));
+});
+$("photo-done").addEventListener("click", () => { photoRun++; stopCamera(); $("photo-box").hidden = true; photoBefore = null; });
+$("photo-undo").addEventListener("click", async () => {
+  $("photo-box").hidden = true;
+  if (photoBefore) await applyRecipe(photoBefore);
+  photoBefore = null;
+});
+
 // ---- Share link ------------------------------------------------------------------------------
 // The recipe goes after the # (never sent to a server), deflated and base64url: opening the link
 // rebuilds the avatar. Unknown item ids (from an older or newer catalog) fall back to the defaults.
@@ -921,6 +1317,7 @@ async function applyRecipe(next) {
   syncControls();
   composeSkin();
   await Promise.all(ITEM_SLOTS.map((c) => setSlot(c, c === "hair" ? recipe.hair.style : recipe[c])));
+  refit();  // the body and face may have changed even if nothing worn did
   // Items that stayed on (same hair style as before) still take the new hair color.
   for (const slot of Object.keys(HAIR_SLOTS)) { const e = worn.get(slot); if (e) recolor(e, slot); }
   scheduleSkin();
@@ -945,7 +1342,7 @@ $("loading").remove();
 setCamera(lastCamera);  // framing for the view's real shape (known now)
 base.loadMore().then(refit, () => {});  // the child and old body shapes: the body may change when they arrive
 renderPresets().catch(() => $("start").remove());
-window.avatarEditor = { exportVRM, applyRecipe, camera, controls, scene, avatar, renderer, showPreview, endPreview, get preview() { return preview; }, get recipe() { return recipe; } };  // for tests
+window.avatarEditor = { exportVRM, applyRecipe, calibratePhotos, fromPhotos, camera, controls, scene, avatar, renderer, showPreview, endPreview, get preview() { return preview; }, get recipe() { return recipe; } };  // for tests
 
 // ---- Live preview ----------------------------------------------------------------------------
 // Preview shows the exported VRM in three-vrm (lib/preview.js, loaded on first use). Changing

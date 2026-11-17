@@ -22,6 +22,10 @@ chair. Any app that reads VRM 1.0 can use them.
   ee, oh), emotions, eyes that look at a target, and hair that sways (spring bones).
 - **Editable again.** The recipe is stored inside the VRM, so opening it in the maker brings back
   every choice.
+- **From a photo** (beta). Take three quick shots with the camera (straight on, then turned a little each
+  way) or pick photos of a face: face shape, ancestry mix, skin tone, eye and hair color (or no hair)
+  are set to resemble it (a resemblance, not a likeness). It runs in the browser with Google's
+  MediaPipe face and hair finders; nothing is uploaded.
 - **Ready-made avatars** to start from, **Surprise me** for a random person in one of their outfits,
   and a live preview, seated or standing.
 - **Plain GLB too.** "Download as GLB" gives the same avatar without the VRM extensions, for Blender,
@@ -41,9 +45,13 @@ The site is static: serve `web/` with any web server and open `/editor/`.
 python3 tools/devserver/serve.py      # serves the repo at http://localhost:5288/web/editor/
 ```
 
+From another machine, add `--lan`; add `--https` too for the camera (browsers only allow it on
+https or localhost; the certificate is self-signed, so accept the warning once).
+
 `web/assets/` (body data, clothes, textures, thumbnails) is generated and committed, so this works
-without the asset pipeline. three.js, three-vrm and meshoptimizer are vendored in `web/vendor/`;
-there is no build step and no outside requests.
+without the asset pipeline. three.js, three-vrm, meshoptimizer and MediaPipe Tasks Vision (with its
+face and hair models, loaded only for "From a photo") are vendored in `web/vendor/`; there is no build step
+and no outside requests.
 
 ## The asset pipeline
 
@@ -82,5 +90,6 @@ assets/        committed pipeline outputs: lighter parts, coverage, painted and 
 ## License
 
 The code is MIT (see `LICENSE`). The avatar assets are CC0; see `ASSETS.md` for every item and its
-author. three.js, three-vrm and meshoptimizer keep their own MIT licenses (`web/vendor/*/LICENSE*`).
+author. three.js, three-vrm and meshoptimizer keep their own MIT licenses, MediaPipe Tasks Vision
+and its face and hair models the Apache 2.0 license (`web/vendor/*/LICENSE*`).
 Avatars you make are yours: the downloaded VRM allows any use, modification and redistribution.

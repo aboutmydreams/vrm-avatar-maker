@@ -2,12 +2,16 @@
 
 The save endpoint lets a browser test hand an exported VRM to scripts/check-vrm.ts. It only accepts
 requests from this machine, even when the server listens on the network.
-Usage: python3 tools/devserver/serve.py [port] [--lan]   (default 5288, localhost only)
-  --lan  also listen on the network (LAN and Tailscale), e.g. to use the editor from another Mac
+Usage: python3 tools/devserver/serve.py [port] [--lan] [--https]   (default 5288, localhost only)
+  --lan    also listen on the network (LAN and Tailscale), e.g. to use the editor from another Mac
+  --https  serve over HTTPS with a self-signed certificate (made once, in tools/devserver/.cert/):
+           other machines need it for the camera ("From a photo"); the browser warns once, accept it
 """
 import http.server
 import os
 import re
+import ssl
+import subprocess
 import sys
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
@@ -38,11 +42,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
 
+def certificate():
+    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cert")
+    cert, key = os.path.join(folder, "cert.pem"), os.path.join(folder, "key.pem")
+    if not os.path.exists(cert):
+        os.makedirs(folder, exist_ok=True)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "825",
+                        "-subj", "/CN=avatar-editor-dev", "-keyout", key, "-out", cert], check=True)
+    return cert, key
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--lan"]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     port = int(args[0]) if args else 5288
     host = "0.0.0.0" if "--lan" in sys.argv else "127.0.0.1"
-    print(f"serving {ROOT} on http://{host}:{port}/web/editor/", flush=True)
+    https = "--https" in sys.argv
     # The editor fires ~100 requests at once (thumbnails, textures); the default backlog of 5 refuses some.
     http.server.ThreadingHTTPServer.request_queue_size = 128
-    http.server.ThreadingHTTPServer((host, port), Handler).serve_forever()
+    server = http.server.ThreadingHTTPServer((host, port), Handler)
+    if https:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(*certificate())
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(f"serving {ROOT} on {'https' if https else 'http'}://{host}:{port}/web/editor/", flush=True)
+    server.serve_forever()
