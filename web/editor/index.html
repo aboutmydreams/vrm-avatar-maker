@@ -38,6 +38,8 @@
   #tone { background: linear-gradient(to right, var(--tone-light), var(--tone-dark)); border-radius: 4px; height: 10px; -webkit-appearance: none; appearance: none; }
   #tone::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #fff; border: 2px solid #333; }
   #bar { flex: none; background: var(--panel); border-top: 1px solid var(--line); padding: 10px 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  #send { grid-column: 1 / -1; }
+  #send[hidden] { display: none; }
   #bar input[type=text] { grid-column: 1 / -1; background: #2a2c31; border: 1px solid var(--line); color: var(--fg); padding: 6px 8px; border-radius: 6px; }
   #fixlink { grid-column: 1 / -1; color: var(--muted); font-size: 12px; text-align: center; }
   button.glb { grid-column: 1 / -1; background: none; border: none; padding: 0; color: var(--muted); font-size: 12px; text-decoration: underline; cursor: pointer; }
@@ -220,6 +222,7 @@
   </div>
   <div id="bar">
     <input type="text" id="name" placeholder="Avatar name" maxlength="60">
+    <button class="main" id="send" hidden></button>
     <button class="main" id="download">Download VRM</button>
     <button class="plain" id="open">Open VRM…</button>
     <button class="glb" id="download-glb" title="The same avatar as plain glTF, for Blender, game engines and 3D viewers that don't read VRM">Download as GLB (for Blender, game engines)</button>

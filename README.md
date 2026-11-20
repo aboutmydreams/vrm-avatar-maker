@@ -30,6 +30,9 @@ chair. Any app that reads VRM 1.0 can use them.
   and a live preview, seated or standing.
 - **Plain GLB too.** "Download as GLB" gives the same avatar without the VRM extensions, for Blender,
   game engines and 3D viewers that don't read VRM (bones, skin and face shapes are kept).
+- **Straight to your site** (avatar handoff). A site can open the maker in a popup, hand it the
+  user's current avatar, and get the finished VRM back directly: no download and re-upload, no
+  server in between. See [docs/handoff.md](docs/handoff.md) and the demo at `/handoff/demo.html`.
 - **Share links.** "Copy link" gives a link that opens your avatar in the maker (the choices travel
   after the `#`, so they never reach a server).
 - **Fix my VRM** (`/fix/`): shrinks any VRM 0.x or 1.0 that's over the budget (drops unused

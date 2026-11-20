@@ -1111,8 +1111,12 @@ async function recipeFromLink(hash) {
   const bin = atob(code.replace(/-/g, "+").replace(/_/g, "/"));
   const packed = Uint8Array.from(bin, (c) => c.charCodeAt(0));
   const text = await new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).text();
-  const found = JSON.parse(text);
-  if (!found || typeof found !== "object") return null;
+  return checkedRecipe(JSON.parse(text));
+}
+/** A recipe from outside (a link, another site): only ids this catalog has (others: the defaults). */
+function checkedRecipe(found) {
+  if (!found || typeof found !== "object" || Array.isArray(found)) return null;
+  found = structuredClone(found);
   for (const slot of ITEM_SLOTS) {  // only ids this catalog has
     const id = slot === "hair" ? found.hair?.style : found[slot];
     if (id && !index.categories[slot]?.items.some((i) => i.id === id)) {
@@ -1273,7 +1277,7 @@ function plainGLB(vrm) {
   out.set(bytes, 20); out.fill(0x20, 20 + bytes.length, 20 + padded); out.set(bin, 20 + padded);
   return out.buffer;
 }
-function downloadButtons() { return ["download", "download-glb", "panel-glb"].map((id) => $(id)); }
+function downloadButtons() { return ["download", "download-glb", "panel-glb", "send"].map((id) => $(id)); }
 async function download(asGLB, button) {
   const label = button.textContent;
   for (const b of downloadButtons()) b.disabled = true;
@@ -1288,6 +1292,79 @@ async function download(asGLB, button) {
 }
 $("download").addEventListener("click", () => download(false, $("download")));
 for (const id of ["download-glb", "panel-glb"]) $(id).addEventListener("click", () => download(true, $(id)));
+
+// ---- Avatar handoff (docs/handoff.md) --------------------------------------------------------
+// Another site opens the maker in a popup (or an iframe) with ?host=<its origin>. The two pages talk
+// with postMessage, only ever to and from that exact origin: the site may send a starting avatar, and
+// "Send to <site>" hands the finished VRM straight back, no download and upload. Nothing goes through
+// a server and the maker needs no login: the site saves the avatar with its own.
+const HANDOFF = "avatar-handoff:";
+let handoff = null;  // { peer, origin, label }
+function handoffOrigin() {
+  const host = new URLSearchParams(location.search).get("host");
+  if (!host) return null;
+  try {
+    const u = new URL(host);
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+    return u.protocol === "https:" || (u.protocol === "http:" && local) ? u.origin : null;
+  } catch { return null; }
+}
+function startHandoff() {
+  const origin = handoffOrigin(), peer = window.opener ?? (window.parent !== window ? window.parent : null);
+  if (!origin || !peer) return;
+  handoff = { peer, origin, label: new URL(origin).host };
+  const post = (msg, transfer = []) => { try { handoff.peer.postMessage({ version: 1, ...msg }, handoff.origin, transfer); return true; } catch { return false; } };
+  handoff.post = post;
+  showSend();
+  let heard = false;
+  window.addEventListener("message", async (e) => {
+    if (e.origin !== handoff.origin || e.source !== handoff.peer || typeof e.data?.type !== "string" || !e.data.type.startsWith(HANDOFF)) return;
+    heard = true;
+    const msg = e.data, kind = msg.type.slice(HANDOFF.length);
+    if (kind === "start") {
+      if (typeof msg.label === "string" && msg.label.trim()) { handoff.label = msg.label.trim().slice(0, 40); showSend(); }
+      try {
+        let next = null;
+        if (msg.vrm instanceof ArrayBuffer) next = checkedRecipe(readRecipe(msg.vrm));
+        else if (msg.recipe) next = checkedRecipe(msg.recipe);
+        if (next) { endPreview(); await applyRecipe({ ...next, name: String(msg.name ?? next.name ?? recipe.name ?? "").slice(0, 60) }); }
+        else if (typeof msg.name === "string") { recipe.name = msg.name.slice(0, 60); $("name").value = recipe.name; }
+      } catch (err) {
+        $("status").textContent = `Your avatar from ${handoff.label} couldn't be opened here: ${err.message} Starting from this one instead.`;
+      }
+    } else if (kind === "received") {
+      const box = $("send");
+      if (msg.ok === false) { $("status").textContent = `${handoff.label} didn't take the avatar` + (msg.error ? `: ${String(msg.error).slice(0, 200)}` : "."); box.textContent = `Send to ${handoff.label}`; updateStatus(); return; }
+      box.textContent = `Sent to ${handoff.label} ✓`;
+      $("status").textContent = `Sent to ${handoff.label}.` + (window.opener ? " This window closes now." : "");
+      if (window.opener) setTimeout(() => window.close(), 1200);
+    }
+  });
+  // Say hello until the site answers (it may still be setting up when we're ready).
+  post({ type: HANDOFF + "ready", maker: "VRM Avatar Maker", formats: ["vrm1"] });
+  let tries = 0;
+  const hello = setInterval(() => { if (heard || ++tries > 20) clearInterval(hello); else post({ type: HANDOFF + "ready", maker: "VRM Avatar Maker", formats: ["vrm1"] }); }, 500);
+  window.addEventListener("pagehide", () => post({ type: HANDOFF + "closed" }));
+}
+function showSend() {
+  const b = $("send");
+  b.hidden = false; b.textContent = `Send to ${handoff.label}`;
+  b.title = `Hands this avatar straight to ${handoff.origin} (the page that opened the maker)`;
+}
+$("send").addEventListener("click", async () => {
+  if (!handoff) return;
+  if (window.opener ? window.opener.closed : false) { $("status").textContent = `The ${handoff.label} page that opened this is gone. Download the VRM instead.`; return; }
+  for (const b of downloadButtons()) b.disabled = true;
+  $("send").textContent = "Building…";
+  try {
+    const vrm = await exportVRM();
+    if (!handoff.post({ type: HANDOFF + "avatar", format: "vrm1", name: recipe.name ?? "", vrm }, [vrm])) throw new Error("couldn't reach the page");
+    $("send").textContent = "Sent, waiting for an answer…";
+  } catch (err) {
+    $("status").textContent = `Couldn't send to ${handoff.label} (${err.message}). Download the VRM instead.`;
+    $("send").textContent = `Send to ${handoff.label}`;
+  } finally { updateStatus(); }
+});
 
 function readRecipe(buffer) {
   const dv = new DataView(buffer);
@@ -1342,6 +1419,7 @@ $("loading").remove();
 setCamera(lastCamera);  // framing for the view's real shape (known now)
 base.loadMore().then(refit, () => {});  // the child and old body shapes: the body may change when they arrive
 renderPresets().catch(() => $("start").remove());
+startHandoff();
 window.avatarEditor = { exportVRM, applyRecipe, calibratePhotos, fromPhotos, camera, controls, scene, avatar, renderer, showPreview, endPreview, get preview() { return preview; }, get recipe() { return recipe; } };  // for tests
 
 // ---- Live preview ----------------------------------------------------------------------------

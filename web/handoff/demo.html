@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avatar handoff demo</title>
+<style>
+  :root { --bg: #26282b; --panel: #1b1c1f; --line: #34363b; --fg: #ececec; --muted: #9a9ca3; --accent: #e0a458; --good: #6cc48a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .muted { color: var(--muted); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin: 20px 0; }
+  button { background: var(--accent); color: #1b1c1f; border: none; border-radius: 6px; padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.plain { background: #2a2c31; color: var(--fg); border: 1px solid var(--line); font-weight: 400; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  #log { font: 12px/1.5 ui-monospace, monospace; color: var(--muted); white-space: pre-wrap; margin: 0; max-height: 220px; overflow: auto; }
+  .ok { color: var(--good); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>A pretend site</h1>
+  <p class="muted">This page plays a site that keeps its users' avatars. "Make my avatar" opens VRM Avatar Maker;
+    its "Send to…" button hands the avatar straight back here, no download and upload. Edit again and the maker
+    starts from the avatar this page has. See <a href="https://github.com/ffunch/vrm-avatar-maker/blob/main/docs/handoff.md">docs/handoff.md</a>.</p>
+  <div class="card">
+    <p id="have">No avatar yet.</p>
+    <div class="row">
+      <button id="edit">Make my avatar</button>
+      <button class="plain" id="save" hidden>Download it</button>
+      <label class="muted"><input type="checkbox" id="refuse"> Refuse the next one (to see an error)</label>
+    </div>
+  </div>
+  <div class="card"><pre id="log"></pre></div>
+</main>
+<script>
+  // The site's side of the avatar handoff (docs/handoff.md). The maker is on this same server here;
+  // a real site would use https://avatars.somanyrooms.com.
+  const MAKER = location.origin;
+  const MAKER_PAGE = new URL("../editor/", location.href).href;
+  let avatar = null;  // { vrm: ArrayBuffer, name }
+  const $ = (id) => document.getElementById(id);
+  const log = (text) => { $("log").textContent += `${new Date().toLocaleTimeString()}  ${text}\n`; $("log").scrollTop = 1e9; };
+
+  function show() {
+    $("have").innerHTML = avatar ? `<span class="ok">✓</span> Avatar: <b></b> (${(avatar.vrm.byteLength / 1e6).toFixed(1)} MB VRM)` : "No avatar yet.";
+    if (avatar) $("have").querySelector("b").textContent = avatar.name || "unnamed";
+    $("edit").textContent = avatar ? "Edit my avatar" : "Make my avatar";
+    $("save").hidden = !avatar;
+  }
+
+  $("edit").addEventListener("click", () => {
+    const popup = window.open(`${MAKER_PAGE}?host=${encodeURIComponent(location.origin)}`, "avatar-maker", "width=1200,height=800");
+    if (!popup) { log("The popup was blocked."); return; }
+    let started = false;
+    async function onMessage(e) {
+      if (e.origin !== MAKER || e.source !== popup || typeof e.data?.type !== "string") return;
+      const msg = e.data;
+      log(`← ${msg.type}` + (msg.vrm ? ` (${(msg.vrm.byteLength / 1e6).toFixed(1)} MB, "${msg.name}")` : ""));
+      if (msg.type === "avatar-handoff:ready" && !started) {
+        started = true;
+        const start = { type: "avatar-handoff:start", version: 1, label: "the demo site" };
+        if (avatar) { start.vrm = avatar.vrm.slice(0); start.name = avatar.name; }
+        popup.postMessage(start, MAKER, start.vrm ? [start.vrm] : []);
+        log(`→ avatar-handoff:start` + (start.vrm ? " with the current avatar" : ""));
+      } else if (msg.type === "avatar-handoff:avatar") {
+        if ($("refuse").checked) {
+          $("refuse").checked = false;
+          popup.postMessage({ type: "avatar-handoff:received", version: 1, ok: false, error: "the demo was told to refuse this one" }, MAKER);
+          log("→ avatar-handoff:received (refused)");
+          return;
+        }
+        avatar = { vrm: msg.vrm, name: msg.name };  // a real site would upload it here
+        show();
+        popup.postMessage({ type: "avatar-handoff:received", version: 1, ok: true }, MAKER);
+        log("→ avatar-handoff:received ok");
+      } else if (msg.type === "avatar-handoff:closed") {
+        window.removeEventListener("message", onMessage);
+      }
+    }
+    window.addEventListener("message", onMessage);
+    log("Opened the maker.");
+  });
+
+  $("save").addEventListener("click", () => {
+    const url = URL.createObjectURL(new Blob([avatar.vrm], { type: "model/gltf-binary" }));
+    Object.assign(document.createElement("a"), { href: url, download: (avatar.name || "avatar").replace(/[^\w-]+/g, "-") + ".vrm" }).click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  });
+  show();
+</script>
+</body>
+</html>
