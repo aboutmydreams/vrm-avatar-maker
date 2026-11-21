@@ -55,6 +55,21 @@ python3 tools/devserver/serve.py      # serves the repo at http://localhost:5288
 From another machine, add `--lan`; add `--https` too for the camera (browsers only allow it on
 https or localhost; the certificate is self-signed, so accept the warning once).
 
+## Deploy to Cloudflare Pages
+
+The Python server is only for local testing. The production site is entirely static; no build
+command or server runtime is needed. `wrangler.jsonc` points Pages at `web/`.
+
+```sh
+npx wrangler@latest pages project create vrm-avatar-maker-preview --production-branch main --force
+npx wrangler@latest pages deploy web --project-name vrm-avatar-maker-preview --branch feature/cloudflare-pages
+```
+
+The `--force` flag is needed only when creating a Pages project with current Wrangler versions;
+subsequent deployments need only `pages deploy`. For Git-based
+deployments instead, connect the repository in Cloudflare Pages with no build command and `web` as
+the output directory. Cloudflare's HTTPS also allows the camera feature to work.
+
 `web/assets/` (body data, clothes, textures, thumbnails) is generated and committed, so this works
 without the asset pipeline. three.js, three-vrm, meshoptimizer and MediaPipe Tasks Vision (with its
 face and hair models, loaded only for "From a photo") are vendored in `web/vendor/`; there is no build step
